@@ -529,8 +529,9 @@
       const script = document.createElement("script");
       const timeout = window.setTimeout(() => {
         cleanup();
-        resolve();
-      }, 1500);
+        script.remove();
+        reject(new Error("页面请求桥接脚本加载超时"));
+      }, 5000);
 
       function cleanup() {
         window.clearTimeout(timeout);
@@ -560,6 +561,10 @@
         reject(new Error("页面请求桥接脚本加载失败"));
       };
       (document.head || document.documentElement).appendChild(script);
+    });
+
+    pageBridgeReadyPromise.catch(() => {
+      pageBridgeReadyPromise = null;
     });
 
     return pageBridgeReadyPromise;
@@ -613,6 +618,20 @@
     });
   }
 
+  function resolveCsrfBody(message) {
+    if (!message.autoCsrf) return message.body || undefined;
+    if (!message.body || !message.body.includes("__AUTO__")) return message.body;
+
+    const csrf = getCookieValue("bili_jct");
+    if (!csrf) return null;
+
+    const params = new URLSearchParams(message.body);
+    for (const [key, value] of Array.from(params.entries())) {
+      if (value === "__AUTO__") params.set(key, csrf);
+    }
+    return params.toString();
+  }
+
   async function apiFetch(path, options = {}) {
     if (!window.chrome?.runtime?.sendMessage) {
       throw new Error("扩展后台不可用，请重新加载扩展后再试");
@@ -651,10 +670,15 @@
       if (isApiBlockStatus(pageStatus)) {
         throw new Error(apiBlockMessage(pageStatus, requestLabel));
       }
-      if (message.method.toUpperCase() !== "GET") {
+      const fallbackBody = resolveCsrfBody(message);
+      if (message.method.toUpperCase() !== "GET" && fallbackBody === null) {
         throw pageError;
       }
-      const response = await chrome.runtime.sendMessage(message);
+      const response = await chrome.runtime.sendMessage({
+        ...message,
+        body: fallbackBody === null ? message.body : fallbackBody,
+        autoCsrf: false,
+      });
       if (!response?.ok) {
         const backgroundStatus = httpStatusFromError(response?.error);
         if (isApiBlockStatus(backgroundStatus)) {
@@ -772,10 +796,33 @@
   function isBannedAccountPayload(payload) {
     const code = Number(payload?.code);
     const message = normalizeText(payload?.message || payload?.msg || "");
+    if (isRiskControlCode(code)) return false;
     return (
-      [-404, -403, -400, -352].includes(code) ||
+      [-404, -403, -400].includes(code) ||
       /封禁|封鎖|被封|账号异常|账号不存在|用户不存在|空间隐私|访问权限|非法用户/.test(message)
     );
+  }
+
+  function isRiskControlCode(code) {
+    return [-352, -412, -509].includes(Number(code));
+  }
+
+  function isRiskControlPayload(payload) {
+    return isRiskControlCode(payload?.code);
+  }
+
+  function stopApiMessage(code, label = "", detail = "") {
+    const stage = label ? `（阶段：${normalizeText(label).slice(0, 40)}）` : "";
+    if (Number(code) === -352) {
+      return `接口返回 -352${stage}：需要安全验证。请在 B 站页面手动点击一次取关并完成验证后，再回来继续。`;
+    }
+    if (Number(code) === -101 || Number(code) === -111) {
+      return `接口返回 ${code}${stage}：登录态失效，已停止本次操作。请确认网页已登录 B 站后重试。`;
+    }
+    const detailText = normalizeText(detail).slice(0, 60);
+    return `接口返回 ${code}${stage}${
+      detailText ? `：${detailText}` : ""
+    }：已停止本次操作。请稍后再试。`;
   }
 
   function isBannedAccountText(value) {
@@ -1109,6 +1156,15 @@
       return;
     }
 
+    const loginMid = getCookieValue("DedeUserID");
+    if (loginMid && String(loginMid) !== String(vmid)) {
+      addLog(
+        "当前页面不是你自己的关注列表页，已停止扫描，避免误操作到别的账号。请打开自己的关注列表页后重试。",
+        "warn"
+      );
+      return;
+    }
+
     resetCandidatesForScan("name");
     state.isScanning = true;
     state.stopRequested = false;
@@ -1152,6 +1208,12 @@
             order_type: "attention",
           },
         });
+
+        if (Number(payload?.code) !== 0 && isStopApiCode(payload?.code)) {
+          addLog(stopApiMessage(payload.code, "接口扫描", payload?.message), "security");
+          state.stopRequested = true;
+          break;
+        }
 
         assertApiOk(payload, "读取关注列表失败");
         const data = payload.data || {};
@@ -1503,15 +1565,20 @@
       const nav = await getNavForWbi();
       addLog(`开始按 UP 主活跃度扫描：${state.settings.inactiveMonths} 个月未投稿且未发动态，包含从未投稿账号。`, "info");
       if (nav.mid && vmid && nav.mid !== vmid) {
-        addLog("当前页面账号与登录账号不一致，已改用登录账号关注列表。", "warn");
+        addLog(
+          "当前页面不是你自己的关注列表页，已停止扫描，避免误操作到别的账号。请打开自己的关注列表页后重试。",
+          "warn"
+        );
+        return;
       }
+      const targetMid = nav.mid || vmid;
       const checkLimit = clampNumber(
         state.settings.inactiveCheckLimit,
         DEFAULT_SETTINGS.inactiveCheckLimit,
         20,
         5000
       );
-      const allAccounts = await fetchFollowingAccounts(nav.mid || vmid, checkLimit);
+      const allAccounts = await fetchFollowingAccounts(targetMid, checkLimit);
       const accounts = allAccounts.slice(0, checkLimit);
       addLog(
         `本次检查前 ${accounts.length}/${allAccounts.length} 个关注账号，可在设置里调整检查上限。`,
@@ -1551,6 +1618,12 @@
           `投稿检查第 ${index + 1}/${accounts.length}`
         );
 
+        if (latest.status === "unknown" && isStopApiCode(latest.code)) {
+          addLog(stopApiMessage(latest.code, "投稿检查", latest.message), "security");
+          state.stopRequested = true;
+          break;
+        }
+
         if (latest.status === "banned") {
           if (state.settings.inactiveIncludeBannedAccount) {
             const candidate = buildInactiveCandidate(account, {
@@ -1582,6 +1655,12 @@
             `动态检查第 ${index + 1}/${accounts.length}`
           );
           dynamicChecked += 1;
+
+          if (dynamic.status === "unknown" && isStopApiCode(dynamic.code)) {
+            addLog(stopApiMessage(dynamic.code, "动态检查", dynamic.message), "security");
+            state.stopRequested = true;
+            break;
+          }
 
           if (dynamic.status === "banned") {
             if (state.settings.inactiveIncludeBannedAccount) {
@@ -1917,11 +1996,15 @@
         message,
       };
     } catch (error) {
-      const message = error?.message || "接口取关失败";
+      const status = httpStatusFromError(error);
+      const blocked = isApiBlockStatus(status);
+      const message = blocked
+        ? apiBlockMessage(status, "接口取关")
+        : error?.message || "接口取关失败";
       candidate.status = "failed";
       candidate.note = message;
       renderCandidateList();
-      return { done: false, shouldStop: false, message };
+      return { done: false, shouldStop: blocked, message };
     }
   }
 
@@ -1938,38 +2021,41 @@
     let unchangedRounds = 0;
     let lastScrollY = window.scrollY;
 
-    for (let round = 1; round <= state.settings.scanRounds; round += 1) {
-      if (state.stopRequested) break;
-      await waitWhilePaused();
-      if (state.stopRequested) break;
+    try {
+      for (let round = 1; round <= state.settings.scanRounds; round += 1) {
+        if (state.stopRequested) break;
+        await waitWhilePaused();
+        if (state.stopRequested) break;
 
-      const added = scanVisibleCandidates();
-      addLog(`扫描 ${round}/${state.settings.scanRounds}：新增 ${added} 个。`, "info");
+        const added = scanVisibleCandidates();
+        addLog(`扫描 ${round}/${state.settings.scanRounds}：新增 ${added} 个。`, "info");
 
-      window.scrollBy({
-        top: Math.max(500, Math.round(window.innerHeight * 0.85)),
-        behavior: "smooth",
-      });
-      await sleepInterruptibly(state.settings.scrollDelayMs);
+        window.scrollBy({
+          top: Math.max(500, Math.round(window.innerHeight * 0.85)),
+          behavior: "smooth",
+        });
+        await sleepInterruptibly(state.settings.scrollDelayMs);
 
-      const moved = Math.abs(window.scrollY - lastScrollY) >= 5;
-      unchangedRounds = moved ? 0 : unchangedRounds + 1;
-      lastScrollY = window.scrollY;
+        const moved = Math.abs(window.scrollY - lastScrollY) >= 5;
+        unchangedRounds = moved ? 0 : unchangedRounds + 1;
+        lastScrollY = window.scrollY;
 
-      if (
-        unchangedRounds >= 3 ||
-        window.innerHeight + window.scrollY >= document.body.scrollHeight - 8
-      ) {
-        scanVisibleCandidates();
-        break;
+        const pageHeight = document.body?.scrollHeight || 0;
+        if (unchangedRounds >= 3 || window.innerHeight + window.scrollY >= pageHeight - 8) {
+          scanVisibleCandidates();
+          break;
+        }
       }
-    }
 
-    state.isScanning = false;
-    state.isPaused = false;
-    renderControls();
-    renderStatus();
-    addLog("扫描结束。", "info");
+      addLog("扫描结束。", "info");
+    } catch (error) {
+      addLog(error?.message || "滚动扫描失败。", "warn");
+    } finally {
+      state.isScanning = false;
+      state.isPaused = false;
+      renderControls();
+      renderStatus();
+    }
   }
 
   async function unfollowSelectedByUi() {
@@ -2004,24 +2090,29 @@
     renderControls();
 
     let success = 0;
-    for (let index = 0; index < targets.length; index += 1) {
-      const candidate = targets[index];
-      if (state.stopRequested) break;
-      await waitWhilePaused();
-      if (state.stopRequested) break;
-      addLog(
-        `取关中：${candidate.name} ${maskId(candidate.mid) || ""}`.trim(),
-        "info"
-      );
-      const done = await unfollowCandidate(candidate);
-      if (done) success += 1;
-    }
+    try {
+      for (let index = 0; index < targets.length; index += 1) {
+        const candidate = targets[index];
+        if (state.stopRequested) break;
+        await waitWhilePaused();
+        if (state.stopRequested) break;
+        addLog(
+          `取关中：${candidate.name} ${maskId(candidate.mid) || ""}`.trim(),
+          "info"
+        );
+        const done = await unfollowCandidate(candidate);
+        if (done) success += 1;
+      }
 
-    state.isUnfollowing = false;
-    state.isPaused = false;
-    renderControls();
-    renderStatus();
-    addLog(`取关结束：成功点击 ${success}/${targets.length} 个。`, "info");
+      addLog(`取关结束：成功点击 ${success}/${targets.length} 个。`, "info");
+    } catch (error) {
+      addLog(error?.message || "页面取关失败。", "warn");
+    } finally {
+      state.isUnfollowing = false;
+      state.isPaused = false;
+      renderControls();
+      renderStatus();
+    }
   }
 
   async function unfollowSelectedByApi() {
@@ -2063,38 +2154,46 @@
     let success = 0;
     let attempted = 0;
 
-    for (let index = 0; index < targets.length; index += 1) {
-      const candidate = targets[index];
-      if (state.stopRequested) break;
-      await waitWhilePaused();
-      if (state.stopRequested) break;
+    try {
+      for (let index = 0; index < targets.length; index += 1) {
+        const candidate = targets[index];
+        if (state.stopRequested) break;
+        await waitWhilePaused();
+        if (state.stopRequested) break;
 
-      addLog(
-        `接口取关中：${candidate.name} ${maskId(candidate.mid) || ""}`.trim(),
-        "info"
-      );
-      const result = await unfollowCandidateByApi(candidate, csrf);
-      attempted += 1;
-      if (result.done) success += 1;
+        addLog(
+          `接口取关中：${candidate.name} ${maskId(candidate.mid) || ""}`.trim(),
+          "info"
+        );
+        const result = await unfollowCandidateByApi(candidate, csrf);
+        attempted += 1;
+        if (result.done) success += 1;
 
-      if (result.shouldStop) {
-        addLog("接口返回登录、校验、频率或风控类错误，已自动停止。", "warn");
-        state.stopRequested = true;
-        break;
+        if (result.shouldStop) {
+          addLog(
+            result.message || "接口返回登录、校验、频率或风控类错误，已自动停止。",
+            "warn"
+          );
+          state.stopRequested = true;
+          break;
+        }
+
+        if (state.stopRequested || attempted >= targets.length) break;
+        if (index < targets.length - 1) {
+          await sleepInterruptibly(UNFOLLOW_ACTION_INTERVAL_MS);
+        }
       }
 
-      if (state.stopRequested || attempted >= targets.length) break;
-      if (index < targets.length - 1) {
-        await sleepInterruptibly(UNFOLLOW_ACTION_INTERVAL_MS);
-      }
+      addLog(`接口取关结束：成功 ${success}/${attempted} 个。`, "info");
+    } catch (error) {
+      addLog(error?.message || "接口取关失败。", "warn");
+    } finally {
+      state.isUnfollowing = false;
+      state.isPaused = false;
+      state.progress = "";
+      renderControls();
+      renderStatus();
     }
-
-    state.isUnfollowing = false;
-    state.isPaused = false;
-    state.progress = "";
-    renderControls();
-    renderStatus();
-    addLog(`接口取关结束：成功 ${success}/${attempted} 个。`, "info");
   }
 
   function stopCurrentTask() {
@@ -2651,11 +2750,16 @@
   setInterval(() => {
     if (location.href === lastUrl) return;
     lastUrl = location.href;
+    if (state.isScanning || state.isUnfollowing) {
+      addLog("页面地址变化，但任务仍在进行，已保留当前列表。", "warn");
+      return;
+    }
     state.candidates.clear();
     renderApp();
     addLog("页面地址变化，已重置列表。", "info");
   }, 1000);
 
+  let resizeSaveTimer = 0;
   window.addEventListener("resize", () => {
     const root = document.getElementById(APP_ID);
     if (!root) return;
@@ -2664,7 +2768,8 @@
     const position = clampPanelPosition(rect.left, rect.top, root);
     state.settings.panelLeft = position.left;
     state.settings.panelTop = position.top;
-    saveSettings();
     applyPanelPosition(root);
+    window.clearTimeout(resizeSaveTimer);
+    resizeSaveTimer = window.setTimeout(saveSettings, 300);
   });
 })();

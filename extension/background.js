@@ -16,6 +16,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 async function handleApiFetch(message) {
+  if (String(message.body || "").includes("__AUTO__")) {
+    throw new Error("后台请求缺少 CSRF，已取消该请求");
+  }
+
   const url = new URL(message.url, API_HOST);
   if (url.origin !== API_HOST) {
     throw new Error("Only api.bilibili.com is allowed");
